@@ -34,8 +34,8 @@
 #include <spa/format-builder.h>
 #include <lib/props.h>
 
-#define FRAMES_TO_TIME(this,f)    ((this->current_format.info.raw.framerate.denom * (f) * SPA_NSEC_PER_SEC) / \
-                                   (this->current_format.info.raw.framerate.num))
+#define FRAMES_TO_TIME(this,f) ((this->current_format.info.raw.framerate.denom * (f) * SPA_NSEC_PER_SEC) / \
+                                (this->current_format.info.raw.framerate.num))
 
 typedef struct {
   uint32_t node;
