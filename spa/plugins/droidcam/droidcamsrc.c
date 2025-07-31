@@ -443,9 +443,9 @@ static void yuv420sp_to_rgb(uint8_t *yuv, uint8_t *rgb, int width, int height) {
             B = B < 0 ? 0 : (B > 255 ? 255 : B);
 
             int rgbIndex = (j * width + i) * 3;
-            rgb[rgbIndex + 0] = R;
-            rgb[rgbIndex + 1] = G;
-            rgb[rgbIndex + 2] = B;
+            rgb[rgbIndex + 0] = B;
+			rgb[rgbIndex + 1] = G;
+			rgb[rgbIndex + 2] = R;
         }
     }
 }
