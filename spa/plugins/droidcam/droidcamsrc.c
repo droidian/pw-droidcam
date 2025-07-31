@@ -44,8 +44,6 @@ uint32_t last_frame_size = 0;
 bool frame_ready = false;
 static volatile int keep_running = 1;
 bool frameAvailable = false;
-struct CameraControlListener listener;
-struct CameraControl* cc;
 static pthread_t cam_thread;
 static bool cam_thread_started = false;
 
@@ -129,6 +127,9 @@ struct impl {
 
 	uint64_t frame_count;
 
+	struct CameraControlListener listener;
+	struct CameraControl* cc;
+
 	struct port port;
 };
 
@@ -153,76 +154,119 @@ void error_msg_cb(void* context)
     fprintf(stderr, "%s \n", __PRETTY_FUNCTION__);
 }
 
+void cleanup_camera_resources(struct impl *this,
+                              EGLDisplay *display,
+                              EGLContext *context,
+                              EGLSurface *surface,
+                              GLuint *texture_id) {
+    if (this->cc != NULL) {
+        android_camera_stop_preview(this->cc);
+        android_camera_disconnect(this->cc);
+        this->cc = NULL;
+    }
+
+    if (*texture_id != 0) {
+        glDeleteTextures(1, texture_id);
+        *texture_id = 0;
+    }
+
+    if (*display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(*display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+        if (*context != EGL_NO_CONTEXT) {
+            eglDestroyContext(*display, *context);
+            *context = EGL_NO_CONTEXT;
+        }
+        if (*surface != EGL_NO_SURFACE) {
+            eglDestroySurface(*display, *surface);
+            *surface = EGL_NO_SURFACE;
+        }
+
+        eglTerminate(*display);
+        *display = EGL_NO_DISPLAY;
+    }
+}
+
 void *camera_event_loop(void *arg) {
-    EGLDisplay display;
-    EGLContext context;
-    EGLSurface surface;
+	struct impl *this = (struct impl *)arg;
 
-    EGLint config_attribs[] = {
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_NONE
-    };
-
-    EGLint pbuffer_attribs[] = {
-        EGL_WIDTH, 1,
-        EGL_HEIGHT, 1,
-        EGL_NONE,
-    };
-
-    EGLint context_attribs[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 2,
-        EGL_NONE
-    };
-
-    display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    eglInitialize(display, NULL, NULL);
-
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLSurface surface = EGL_NO_SURFACE;
+    GLuint preview_texture_id = 0;
     EGLConfig config;
     EGLint num_configs;
-    eglChooseConfig(display, config_attribs, &config, 1, &num_configs);
-
-    surface = eglCreatePbufferSurface(display, config, pbuffer_attribs);
-    context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
-    eglMakeCurrent(display, surface, surface, context);
-
-    if(cc == NULL){
-        fprintf(stderr, "[droidcam] Create new listener\n");
-        memset(&listener, 0, sizeof(listener));  
-        listener.on_preview_frame_cb = preview_frame_cb;
-        listener.on_msg_error_cb = error_msg_cb;
-        listener.on_preview_texture_needs_update_cb = preview_texture_needs_update_cb;
-
-        fprintf(stderr, "[droidcam] Connect to camera\n");
-        cc = android_camera_connect_to(BACK_FACING_CAMERA_TYPE, &listener);
-        listener.context = cc;
-
-        GLuint preview_texture_id;
-        glGenTextures(1, &preview_texture_id);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, preview_texture_id);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        android_camera_set_preview_texture(cc, preview_texture_id);
-        android_camera_dump_parameters(cc);
-        android_camera_set_preview_callback_mode(cc, PREVIEW_CALLBACK_ENABLED);
-        android_camera_set_preview_size(cc, 1920, 1080);
-        android_camera_start_preview(cc);
-    }
 
     while (keep_running) {
-        if (frameAvailable){
+    	if(this->cc == NULL && this->started){
+    		EGLint config_attribs[] = {
+		        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+		        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+		        EGL_RED_SIZE, 8,
+		        EGL_GREEN_SIZE, 8,
+		        EGL_BLUE_SIZE, 8,
+		        EGL_ALPHA_SIZE, 8,
+		        EGL_NONE
+		    };
+
+		    EGLint pbuffer_attribs[] = {
+		        EGL_WIDTH, 1,
+		        EGL_HEIGHT, 1,
+		        EGL_NONE,
+		    };
+
+		    EGLint context_attribs[] = {
+		        EGL_CONTEXT_CLIENT_VERSION, 2,
+		        EGL_NONE
+		    };
+
+		    display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+		    eglInitialize(display, NULL, NULL);
+
+		    eglChooseConfig(display, config_attribs, &config, 1, &num_configs);
+
+		    surface = eglCreatePbufferSurface(display, config, pbuffer_attribs);
+		    context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
+		    eglMakeCurrent(display, surface, surface, context);
+
+	        fprintf(stderr, "[droidcam] Create new listener\n");
+	        memset(&this->listener, 0, sizeof(this->listener));  
+	        this->listener.on_preview_frame_cb = preview_frame_cb;
+	        this->listener.on_msg_error_cb = error_msg_cb;
+	        this->listener.on_preview_texture_needs_update_cb = preview_texture_needs_update_cb;
+
+	        fprintf(stderr, "[droidcam] Connect to camera\n");
+	        this->cc = android_camera_connect_to(BACK_FACING_CAMERA_TYPE, &this->listener);
+	        this->listener.context = this->cc;
+
+	        glGenTextures(1, &preview_texture_id);
+	        glBindTexture(GL_TEXTURE_EXTERNAL_OES, preview_texture_id);
+	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	        android_camera_set_preview_texture(this->cc, preview_texture_id);
+	        android_camera_dump_parameters(this->cc);
+	        android_camera_set_preview_callback_mode(this->cc, PREVIEW_CALLBACK_ENABLED);
+	        android_camera_set_preview_size(this->cc, 1920, 1080);
+	        android_camera_start_preview(this->cc);
+	    }
+
+        if (frameAvailable && this->started) {
             frameAvailable = false;
-            android_camera_update_preview_texture(cc);
+            android_camera_update_preview_texture(this->cc);
         }
+
+        if (!this->started && this->cc != NULL) {
+            cleanup_camera_resources(this, &display, &context, &surface, &preview_texture_id);
+        }
+
         usleep(10000); // 10ms
     }
+
+    cleanup_camera_resources(this, &display, &context, &surface, &preview_texture_id);
+
     return NULL;
 }
 
@@ -530,7 +574,7 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 		set_timer(this, true);
 		if (!cam_thread_started) {
             cam_thread_started = true;
-            if (pthread_create(&cam_thread, NULL, camera_event_loop, NULL) != 0) {
+            if (pthread_create(&cam_thread, NULL, camera_event_loop,  (void *)this) != 0) {
                 perror("pthread_create failed");
             } else {
                 fprintf(stderr, "[droidcam] camera_event_loop thread started\n");
