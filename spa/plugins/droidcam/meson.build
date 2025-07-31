@@ -1,7 +1,20 @@
-videotestsrc_sources = ['videotestsrc.c', 'plugin.c']
+droidcam_sources = [
+  'droidcamsrc.c',
+  'plugin.c'
+]
 
-videotestsrclib = shared_library('spa-videotestsrc',
-  videotestsrc_sources,
-  dependencies : [ spa_dep, pthread_lib ],
-  install : true,
-  install_dir : spa_plugindir / 'videotestsrc')
+shared_library('spa-droidcam',
+  droidcam_sources,
+  dependencies: [
+    pipewire_dep,
+    spa_dep,
+    hybris_camera_dep,
+    hybris_media_dep,
+    android_headers_dep,
+    opengl_dep,
+    egl_dep
+  ],
+  include_directories: include_directories('.'),
+  install: true,
+  install_dir: spa_plugins_install_dir
+)

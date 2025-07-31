@@ -7,7 +7,7 @@
 #include <spa/support/plugin.h>
 #include <spa/support/log.h>
 
-extern const struct spa_handle_factory spa_videotestsrc_factory;
+extern const struct spa_handle_factory spa_droidcamsrc_factory;
 
 SPA_LOG_TOPIC_ENUM_DEFINE_REGISTERED;
 
@@ -19,7 +19,7 @@ int spa_handle_factory_enum(const struct spa_handle_factory **factory, uint32_t 
 
 	switch (*index) {
 	case 0:
-		*factory = &spa_videotestsrc_factory;
+		*factory = &spa_droidcamsrc_factory;
 		break;
 	default:
 		return 0;

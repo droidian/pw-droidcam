@@ -25,7 +25,7 @@
 
 #undef SPA_LOG_TOPIC_DEFAULT
 #define SPA_LOG_TOPIC_DEFAULT &log_topic
-SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.videotestsrc");
+SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.droidcamsrc");
 
 #define FRAMES_TO_TIME(port,f) ((port->current_format.info.raw.framerate.denom * (f) * SPA_NSEC_PER_SEC) / \
                                 (port->current_format.info.raw.framerate.num))
@@ -962,9 +962,9 @@ static const struct spa_dict_item info_items[] = {
 
 static const struct spa_dict info = SPA_DICT_INIT_ARRAY(info_items);
 
-const struct spa_handle_factory spa_videotestsrc_factory = {
+const struct spa_handle_factory spa_droidcamsrc_factory = {
 	SPA_VERSION_HANDLE_FACTORY,
-	"videotestsrc",
+	"droidcamsrc",
 	&info,
 	impl_get_size,
 	impl_init,
