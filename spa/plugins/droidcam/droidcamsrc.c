@@ -23,9 +23,31 @@
 #include <spa/param/param.h>
 #include <spa/pod/filter.h>
 
+#include <hybris/camera/camera_compatibility_layer.h>
+#include <hybris/camera/camera_compatibility_layer_capabilities.h>
+
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+
+#include <pthread.h>
+#include <unistd.h>
+
 #undef SPA_LOG_TOPIC_DEFAULT
 #define SPA_LOG_TOPIC_DEFAULT &log_topic
 SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.droidcamsrc");
+
+#define MAX_FRAME_SIZE (1920 * 1080 * 4)
+pthread_mutex_t frame_lock = PTHREAD_MUTEX_INITIALIZER;
+uint8_t last_frame_data[MAX_FRAME_SIZE];
+uint32_t last_frame_size = 0;
+bool frame_ready = false;
+static volatile int keep_running = 1;
+bool frameAvailable = false;
+struct CameraControlListener listener;
+struct CameraControl* cc;
+static pthread_t cam_thread;
+static bool cam_thread_started = false;
 
 #define FRAMES_TO_TIME(port,f) ((port->current_format.info.raw.framerate.denom * (f) * SPA_NSEC_PER_SEC) / \
                                 (port->current_format.info.raw.framerate.num))
@@ -109,6 +131,100 @@ struct impl {
 
 	struct port port;
 };
+
+void preview_frame_cb(void* data, uint32_t data_size, void* context)
+{
+    pthread_mutex_lock(&frame_lock);
+    if (data_size <= sizeof(last_frame_data)) {
+        memcpy(last_frame_data, data, data_size);
+        last_frame_size = data_size;
+        frame_ready = true;
+    }
+    pthread_mutex_unlock(&frame_lock);
+}
+
+void preview_texture_needs_update_cb(void* ctx)
+{
+    frameAvailable = true;
+}
+
+void error_msg_cb(void* context)
+{
+    fprintf(stderr, "%s \n", __PRETTY_FUNCTION__);
+}
+
+void *camera_event_loop(void *arg) {
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface surface;
+
+    EGLint config_attribs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+
+    EGLint pbuffer_attribs[] = {
+        EGL_WIDTH, 1,
+        EGL_HEIGHT, 1,
+        EGL_NONE,
+    };
+
+    EGLint context_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+
+    display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(display, NULL, NULL);
+
+    EGLConfig config;
+    EGLint num_configs;
+    eglChooseConfig(display, config_attribs, &config, 1, &num_configs);
+
+    surface = eglCreatePbufferSurface(display, config, pbuffer_attribs);
+    context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
+    eglMakeCurrent(display, surface, surface, context);
+
+    if(cc == NULL){
+        fprintf(stderr, "[droidcam] Create new listener\n");
+        memset(&listener, 0, sizeof(listener));  
+        listener.on_preview_frame_cb = preview_frame_cb;
+        listener.on_msg_error_cb = error_msg_cb;
+        listener.on_preview_texture_needs_update_cb = preview_texture_needs_update_cb;
+
+        fprintf(stderr, "[droidcam] Connect to camera\n");
+        cc = android_camera_connect_to(BACK_FACING_CAMERA_TYPE, &listener);
+        listener.context = cc;
+
+        GLuint preview_texture_id;
+        glGenTextures(1, &preview_texture_id);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, preview_texture_id);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        android_camera_set_preview_texture(cc, preview_texture_id);
+        android_camera_dump_parameters(cc);
+        android_camera_set_preview_callback_mode(cc, PREVIEW_CALLBACK_ENABLED);
+        android_camera_set_preview_size(cc, 1920, 1080);
+        android_camera_start_preview(cc);
+    }
+
+    while (keep_running) {
+        if (frameAvailable){
+            frameAvailable = false;
+            android_camera_update_preview_texture(cc);
+        }
+        usleep(10000); // 10ms
+    }
+    return NULL;
+}
 
 #define CHECK_PORT(this,d,p)  ((d) == SPA_DIRECTION_OUTPUT && (p) < MAX_PORTS)
 
@@ -254,9 +370,56 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 	return 0;
 }
 
+static void yuv420sp_to_rgb(uint8_t *yuv, uint8_t *rgb, int width, int height) {
+    int frameSize = width * height;
+    uint8_t *yPlane = yuv;
+    uint8_t *vuPlane = yuv + frameSize;
+
+    for (int j = 0; j < height; ++j) {
+        for (int i = 0; i < width; ++i) {
+            int yIndex = j * width + i;
+            int vuIndex = (j / 2) * width + (i & ~1);
+
+            int Y = yPlane[yIndex] & 0xff;
+            int U = vuPlane[vuIndex] & 0xff;
+            int V = vuPlane[vuIndex + 1] & 0xff;
+
+            Y = Y < 16 ? 16 : Y;
+
+            int C = Y - 16;
+            int D = U - 128;
+            int E = V - 128;
+
+            int R = (298 * C + 409 * E + 128) >> 8;
+            int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
+            int B = (298 * C + 516 * D + 128) >> 8;
+
+            R = R < 0 ? 0 : (R > 255 ? 255 : R);
+            G = G < 0 ? 0 : (G > 255 ? 255 : G);
+            B = B < 0 ? 0 : (B > 255 ? 255 : B);
+
+            int rgbIndex = (j * width + i) * 3;
+            rgb[rgbIndex + 0] = R;
+            rgb[rgbIndex + 1] = G;
+            rgb[rgbIndex + 2] = B;
+        }
+    }
+}
+
 static int fill_buffer(struct impl *this, struct buffer *b)
 {
-	return 0;
+    pthread_mutex_lock(&frame_lock);
+
+    uint8_t *src = last_frame_data;
+    uint8_t *dst = b->outbuf->datas[0].data;
+
+    uint32_t width  = this->port.current_format.info.raw.size.width;
+    uint32_t height = this->port.current_format.info.raw.size.height;
+
+    yuv420sp_to_rgb(src, dst, width, height);
+    frame_ready = false;
+    pthread_mutex_unlock(&frame_lock);
+    return 0;
 }
 
 static void set_timer(struct impl *this, bool enabled)
@@ -365,6 +528,14 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 
 		this->started = true;
 		set_timer(this, true);
+		if (!cam_thread_started) {
+            cam_thread_started = true;
+            if (pthread_create(&cam_thread, NULL, camera_event_loop, NULL) != 0) {
+                perror("pthread_create failed");
+            } else {
+                fprintf(stderr, "[droidcam] camera_event_loop thread started\n");
+            }
+        }
 		break;
 	}
 	case SPA_NODE_COMMAND_Suspend:
@@ -382,6 +553,7 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 
 static const struct spa_dict_item node_info_items[] = {
 	{ SPA_KEY_MEDIA_CLASS, "Video/Source" },
+	{ SPA_KEY_MEDIA_ROLE, "Camera" },
 	{ SPA_KEY_NODE_DRIVER, "true" },
 };
 
@@ -465,23 +637,14 @@ static int port_enum_formats(void *object,
 {
 	switch (index) {
 	case 0:
-		*param = spa_pod_builder_add_object(builder,
-			SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-			SPA_FORMAT_mediaType,       SPA_POD_Id(SPA_MEDIA_TYPE_video),
-			SPA_FORMAT_mediaSubtype,    SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-			SPA_FORMAT_VIDEO_format,    SPA_POD_CHOICE_ENUM_Id(3,
-							SPA_VIDEO_FORMAT_RGB,
-							SPA_VIDEO_FORMAT_RGB,
-							SPA_VIDEO_FORMAT_UYVY),
-			SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(
-							&SPA_RECTANGLE(320, 240),
-							&SPA_RECTANGLE(1, 1),
-							&SPA_RECTANGLE(INT32_MAX, INT32_MAX)),
-			SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-							&SPA_FRACTION(25,1),
-							&SPA_FRACTION(0, 1),
-							&SPA_FRACTION(INT32_MAX, 1)));
-		break;
+        *param = spa_pod_builder_add_object(builder,
+            SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+            SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
+            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+            SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_RGB),
+            SPA_FORMAT_VIDEO_size,   SPA_POD_Rectangle(&SPA_RECTANGLE(1920, 1080)),
+            SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&SPA_FRACTION(30, 1)));
+        break;
 	default:
 		return 0;
 	}
@@ -624,11 +787,9 @@ static int port_set_format(struct impl *this, struct port *port,
 			return -EINVAL;
 
 		if (info.info.raw.format == SPA_VIDEO_FORMAT_RGB)
-			port->bpp = 3;
-		else if (info.info.raw.format == SPA_VIDEO_FORMAT_UYVY)
-			port->bpp = 2;
-		else
-			return -EINVAL;
+            port->bpp = 3;
+        else
+            return -EINVAL;
 
 		if (info.info.raw.size.width == 0 ||
 		    info.info.raw.size.height == 0 ||
