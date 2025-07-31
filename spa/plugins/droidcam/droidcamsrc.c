@@ -254,11 +254,9 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 	return 0;
 }
 
-#include "draw.c"
-
 static int fill_buffer(struct impl *this, struct buffer *b)
 {
-	return draw(this, b->outbuf->datas[0].data);
+	return 0;
 }
 
 static void set_timer(struct impl *this, bool enabled)
