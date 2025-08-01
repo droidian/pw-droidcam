@@ -58,6 +58,7 @@ struct buffer {
 	struct spa_buffer *outbuf;
 	bool outstanding;
 	struct spa_meta_header *h;
+	struct spa_meta_videotransform *videotransform;
 	struct spa_list link;
 };
 
@@ -227,7 +228,6 @@ void *camera_event_loop(void *arg) {
 	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 	        android_camera_set_preview_texture(this->cc, preview_texture_id);
-	        android_camera_dump_parameters(this->cc);
 	        android_camera_set_preview_callback_mode(this->cc, PREVIEW_CALLBACK_ENABLED);
 	        android_camera_set_preview_size(this->cc, 1920, 1080);
 	        android_camera_start_preview(this->cc);
@@ -671,6 +671,12 @@ impl_node_port_enum_params(void *object, int seq,
 				SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
 				SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
 			break;
+		case 1:
+			param = (struct spa_pod*)spa_pod_builder_add_object(&b,
+				SPA_TYPE_OBJECT_ParamMeta, id,
+				SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoTransform),
+				SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_videotransform)));
+			break;
 
 		default:
 			return 0;
@@ -819,6 +825,12 @@ impl_node_port_use_buffers(void *object,
 		b->outbuf = buffers[i];
 		b->outstanding = false;
 		b->h = spa_buffer_find_meta_data(buffers[i], SPA_META_Header, sizeof(*b->h));
+
+		b->videotransform = (struct spa_meta_videotransform*)spa_buffer_find_meta_data(
+			buffers[i], SPA_META_VideoTransform, sizeof(*b->videotransform));
+		if (b->videotransform) {
+			b->videotransform->transform = SPA_META_TRANSFORMATION_Flipped90;
+		}
 
 		if (d[0].data == NULL) {
 			spa_log_error(this->log, "%p: invalid memory on buffer %p", this,
