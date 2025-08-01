@@ -12,7 +12,8 @@ shared_library('spa-droidcam',
     hybris_media_dep,
     android_headers_dep,
     opengl_dep,
-    egl_dep
+    egl_dep,
+    yuv_dep
   ],
   include_directories: include_directories('.'),
   install: true,

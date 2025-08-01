@@ -33,6 +33,8 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include <libyuv.h>
+
 #undef SPA_LOG_TOPIC_DEFAULT
 #define SPA_LOG_TOPIC_DEFAULT &log_topic
 SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.droidcamsrc");
@@ -330,42 +332,6 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 	return 0;
 }
 
-static void yuv420sp_to_rgb(uint8_t *yuv, uint8_t *rgb, int width, int height) {
-    int frameSize = width * height;
-    uint8_t *yPlane = yuv;
-    uint8_t *vuPlane = yuv + frameSize;
-
-    for (int j = 0; j < height; ++j) {
-        for (int i = 0; i < width; ++i) {
-            int yIndex = j * width + i;
-            int vuIndex = (j / 2) * width + (i & ~1);
-
-            int Y = yPlane[yIndex] & 0xff;
-            int U = vuPlane[vuIndex] & 0xff;
-            int V = vuPlane[vuIndex + 1] & 0xff;
-
-            Y = Y < 16 ? 16 : Y;
-
-            int C = Y - 16;
-            int D = U - 128;
-            int E = V - 128;
-
-            int R = (298 * C + 409 * E + 128) >> 8;
-            int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
-            int B = (298 * C + 516 * D + 128) >> 8;
-
-            R = R < 0 ? 0 : (R > 255 ? 255 : R);
-            G = G < 0 ? 0 : (G > 255 ? 255 : G);
-            B = B < 0 ? 0 : (B > 255 ? 255 : B);
-
-            int rgbIndex = (j * width + i) * 3;
-            rgb[rgbIndex + 0] = B;
-			rgb[rgbIndex + 1] = G;
-			rgb[rgbIndex + 2] = R;
-        }
-    }
-}
-
 static int fill_buffer(struct impl *this, struct buffer *b)
 {
     pthread_mutex_lock(&frame_lock);
@@ -376,7 +342,17 @@ static int fill_buffer(struct impl *this, struct buffer *b)
     uint32_t width  = this->port.current_format.info.raw.size.width;
     uint32_t height = this->port.current_format.info.raw.size.height;
 
-    yuv420sp_to_rgb(src, dst, width, height);
+    NV21ToRAW(
+	    src,
+	    width,
+	    src + width * height,
+	    width,
+	    dst,
+	    width * 3,
+	    width,
+	    height
+	);
+
     frame_ready = false;
     pthread_mutex_unlock(&frame_lock);
     return 0;
