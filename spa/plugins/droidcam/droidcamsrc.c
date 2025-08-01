@@ -41,6 +41,7 @@ SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.droidcamsrc");
 
 #define MAX_FRAME_SIZE (1920 * 1080 * 4)
 pthread_mutex_t frame_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t cam_lock = PTHREAD_MUTEX_INITIALIZER;
 uint8_t last_frame_data[MAX_FRAME_SIZE];
 uint32_t last_frame_size = 0;
 bool frame_ready = false;
@@ -48,6 +49,8 @@ static volatile int keep_running = 1;
 bool frameAvailable = false;
 static pthread_t cam_thread;
 static bool cam_thread_started = false;
+
+static struct impl *active_camera_impl = NULL;
 
 #define FRAMES_TO_TIME(port,f) ((port->current_format.info.raw.framerate.denom * (f) * SPA_NSEC_PER_SEC) / \
                                 (port->current_format.info.raw.framerate.num))
@@ -114,6 +117,8 @@ struct impl {
 	struct CameraControl* cc;
 
 	struct port port;
+
+	int camera_id;
 };
 
 void preview_frame_cb(void* data, uint32_t data_size, void* context)
@@ -219,7 +224,7 @@ void *camera_event_loop(void *arg) {
 	        this->listener.on_preview_texture_needs_update_cb = preview_texture_needs_update_cb;
 
 	        fprintf(stderr, "[droidcam] Connect to camera\n");
-	        this->cc = android_camera_connect_to(BACK_FACING_CAMERA_TYPE, &this->listener);
+	        this->cc = android_camera_connect_to(this->camera_id, &this->listener);
 	        this->listener.context = this->cc;
 
 	        glGenTextures(1, &preview_texture_id);
@@ -248,6 +253,8 @@ void *camera_event_loop(void *arg) {
     }
 
     cleanup_camera_resources(this, &display, &context, &surface, &preview_texture_id);
+    cam_thread_started = false;
+    fprintf(stderr, "[droidcam] camera_event_loop exit\n");
 
     return NULL;
 }
@@ -455,7 +462,26 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 
 		this->started = true;
 		set_timer(this, true);
+
+		pthread_mutex_lock(&cam_lock);
+		
+		if (active_camera_impl != NULL && active_camera_impl != this) {
+	        active_camera_impl->started = false;
+	        active_camera_impl = NULL;
+
+			if (cam_thread_started) {
+				keep_running = 0;
+				pthread_join(cam_thread, NULL);
+				cam_thread_started = false;
+			}
+
+			active_camera_impl = NULL;
+	    }
+
+	    active_camera_impl = this;
+
 		if (!cam_thread_started) {
+			keep_running = 1;
             cam_thread_started = true;
             if (pthread_create(&cam_thread, NULL, camera_event_loop,  (void *)this) != 0) {
                 perror("pthread_create failed");
@@ -463,6 +489,8 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
                 fprintf(stderr, "[droidcam] camera_event_loop thread started\n");
             }
         }
+
+        pthread_mutex_unlock(&cam_lock);
 		break;
 	}
 	case SPA_NODE_COMMAND_Suspend:
@@ -966,6 +994,7 @@ impl_init(const struct spa_handle_factory *factory,
 {
 	struct impl *this;
 	struct port *port;
+	const char *str = NULL;
 
 	spa_return_val_if_fail(factory != NULL, -EINVAL);
 	spa_return_val_if_fail(handle != NULL, -EINVAL);
@@ -974,6 +1003,12 @@ impl_init(const struct spa_handle_factory *factory,
 	handle->clear = impl_clear;
 
 	this = (struct impl *) handle;
+
+	this->camera_id = 0;
+
+	if (info && (str = spa_dict_lookup(info, "camera.id")) != NULL) {
+        this->camera_id = atoi(str);
+    }
 
 	this->log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log);
 	this->data_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataLoop);
