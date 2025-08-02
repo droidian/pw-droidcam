@@ -115,6 +115,8 @@ struct impl {
 
 	uint64_t frame_count;
 
+	uint32_t orientation;
+
 	struct CameraControlListener listener;
 	struct CameraControl* cc;
 
@@ -245,6 +247,24 @@ void *camera_event_loop(void *arg) {
 	        android_camera_set_preview_callback_mode(this->cc, PREVIEW_CALLBACK_ENABLED);
 	        android_camera_set_preview_size(this->cc, 1920, 1080);
 	        android_camera_start_preview(this->cc);
+
+	        int orientation;
+	        int facing;
+	        android_camera_get_device_info(this->camera_id, &facing, &orientation);
+	        fprintf(stderr, "[droidcam] Orientation is: %u\n", orientation);
+
+	        switch (orientation) {
+			case 90:
+				this->orientation = SPA_META_TRANSFORMATION_Flipped90;
+				break;
+			case 180:
+				//Tbd
+				break;
+			case 270:
+				this->orientation = SPA_META_TRANSFORMATION_270;
+				break;
+			}
+
 	        pthread_mutex_lock(&frame_cond_lock);
 			frameAvailable = true;
 			pthread_cond_signal(&frame_cond);
@@ -854,7 +874,7 @@ impl_node_port_use_buffers(void *object,
 		b->videotransform = (struct spa_meta_videotransform*)spa_buffer_find_meta_data(
 			buffers[i], SPA_META_VideoTransform, sizeof(*b->videotransform));
 		if (b->videotransform) {
-			b->videotransform->transform = SPA_META_TRANSFORMATION_Flipped90;
+			b->videotransform->transform = this->orientation;
 		}
 
 		if (d[0].data == NULL) {
@@ -1030,6 +1050,8 @@ impl_init(const struct spa_handle_factory *factory,
 	if (info && (str = spa_dict_lookup(info, "camera.id")) != NULL) {
         this->camera_id = atoi(str);
     }
+
+    this->orientation = SPA_META_TRANSFORMATION_None;
 
 	this->log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log);
 	this->data_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataLoop);
