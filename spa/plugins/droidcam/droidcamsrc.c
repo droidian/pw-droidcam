@@ -40,24 +40,13 @@
 SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.droidcamsrc");
 
 #define MAX_FRAME_SIZE (1920 * 1080 * 4)
-pthread_cond_t frame_cond = PTHREAD_COND_INITIALIZER;
-pthread_mutex_t frame_cond_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t frame_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t cam_lock = PTHREAD_MUTEX_INITIALIZER;
-uint8_t last_frame_data[MAX_FRAME_SIZE];
-uint32_t last_frame_size = 0;
-bool frame_ready = false;
-static volatile int keep_running = 1;
-bool frameAvailable = false;
-static pthread_t cam_thread;
-static bool cam_thread_started = false;
 
 static struct impl *active_camera_impl = NULL;
 
 #define FRAMES_TO_TIME(port,f) ((port->current_format.info.raw.framerate.denom * (f) * SPA_NSEC_PER_SEC) / \
                                 (port->current_format.info.raw.framerate.num))
 
-#define MAX_BUFFERS 16
+#define MAX_BUFFERS 4
 #define MAX_PORTS 1
 
 struct buffer {
@@ -114,34 +103,43 @@ struct impl {
 	uint64_t elapsed_time;
 
 	uint64_t frame_count;
-
-	uint32_t orientation;
+	struct port port;
 
 	struct CameraControlListener listener;
 	struct CameraControl* cc;
-
-	struct port port;
-
+	uint32_t orientation;
+	uint8_t last_frame_data[MAX_FRAME_SIZE];
+	uint32_t last_frame_size;
+	bool frame_ready;
+	int keep_running;
+	pthread_t cam_thread;
+	bool cam_thread_started;
+	uint32_t frameWidth;
+	uint32_t frameHeight;
 	int camera_id;
 };
 
 void preview_frame_cb(void* data, uint32_t data_size, void* context)
 {
-    pthread_mutex_lock(&frame_lock);
-    if (data_size <= sizeof(last_frame_data)) {
-        memcpy(last_frame_data, data, data_size);
-        last_frame_size = data_size;
-        frame_ready = true;
+	struct impl *this = (struct impl *)context;
+	if(!this->started){
+		this->last_frame_size = 0;
+		return;
+	}
+    if (data_size <= sizeof(this->last_frame_data)) {
+        memcpy(this->last_frame_data, data, data_size);
+        this->last_frame_size = data_size;
+        this->frame_ready = true;
     }
-    pthread_mutex_unlock(&frame_lock);
 }
 
 void preview_texture_needs_update_cb(void* ctx)
 {
-    pthread_mutex_lock(&frame_cond_lock);
-    frameAvailable = true;
-    pthread_cond_signal(&frame_cond);
-    pthread_mutex_unlock(&frame_cond_lock);
+	struct impl *this = (struct impl *)ctx;
+    if(this->cc != NULL && this->started)
+    	android_camera_update_preview_texture(this->cc);
+    else
+    	this->last_frame_size = 0;
 }
 
 void error_msg_cb(void* context)
@@ -229,11 +227,11 @@ void *camera_event_loop(void *arg) {
     EGLSurface surface = EGL_NO_SURFACE;
     GLuint preview_texture_id = 0;
 
-    while (keep_running) {
+    while (this->keep_running) {
     	if(this->cc == NULL && this->started){
 
     		setup_fake_egl(display, context, surface, &preview_texture_id);
-	        fprintf(stderr, "[droidcam] Create new listener\n");
+	        fprintf(stderr, "[droidcam] Create new listener for %p\n", this);
 	        memset(&this->listener, 0, sizeof(this->listener));  
 	        this->listener.on_preview_frame_cb = preview_frame_cb;
 	        this->listener.on_msg_error_cb = error_msg_cb;
@@ -241,11 +239,11 @@ void *camera_event_loop(void *arg) {
 
 	        fprintf(stderr, "[droidcam] Connect to camera\n");
 	        this->cc = android_camera_connect_to(this->camera_id, &this->listener);
-	        this->listener.context = this->cc;
+	        this->listener.context = this;
 
 	        android_camera_set_preview_texture(this->cc, preview_texture_id);
 	        android_camera_set_preview_callback_mode(this->cc, PREVIEW_CALLBACK_ENABLED);
-	        android_camera_set_preview_size(this->cc, 1920, 1080);
+	        android_camera_set_preview_size(this->cc, this->frameWidth, this->frameHeight);
 	        android_camera_start_preview(this->cc);
 
 	        int orientation;
@@ -264,34 +262,12 @@ void *camera_event_loop(void *arg) {
 				this->orientation = SPA_META_TRANSFORMATION_270;
 				break;
 			}
-
-	        pthread_mutex_lock(&frame_cond_lock);
-			frameAvailable = true;
-			pthread_cond_signal(&frame_cond);
-			pthread_mutex_unlock(&frame_cond_lock);
 	    }
-
-		pthread_mutex_lock(&frame_cond_lock);
-		while (!frameAvailable && keep_running) {
-		    pthread_cond_wait(&frame_cond, &frame_cond_lock);
-		}
-
-		if (!keep_running) {
-		    pthread_mutex_unlock(&frame_cond_lock);
-		    break;
-		}
-
-		frameAvailable = false;
-		pthread_mutex_unlock(&frame_cond_lock);
-
-		if (this->started) {
-		    android_camera_update_preview_texture(this->cc);
-		}
+        usleep(10000);
     }
-
     cleanup_camera_resources(this, &display, &context, &surface, &preview_texture_id);
-    cam_thread_started = false;
-    fprintf(stderr, "[droidcam] camera_event_loop exit\n");
+    this->cam_thread_started = false;
+    fprintf(stderr, "[droidcam] camera_event_loop exit %p\n", this);
 
     return NULL;
 }
@@ -378,27 +354,25 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 
 static int fill_buffer(struct impl *this, struct buffer *b)
 {
-    pthread_mutex_lock(&frame_lock);
-
-    uint8_t *src = last_frame_data;
     uint8_t *dst = b->outbuf->datas[0].data;
 
     uint32_t width  = this->port.current_format.info.raw.size.width;
     uint32_t height = this->port.current_format.info.raw.size.height;
 
-    NV21ToRAW(
-	    src,
-	    width,
-	    src + width * height,
-	    width,
-	    dst,
-	    width * 3,
-	    width,
-	    height
-	);
+	size_t y_size = width * height;
+    size_t vu_size = y_size / 2;
 
-    frame_ready = false;
-    pthread_mutex_unlock(&frame_lock);
+    if (this->last_frame_size > 0) {
+        uint8_t *src = this->last_frame_data;
+        memcpy(dst, src, y_size + vu_size);
+        this->frame_ready = false;
+    } else {
+        memset(dst, 0, y_size);
+        for (size_t i = 0; i < vu_size; i += 2) {
+            dst[y_size + i]     = 128;
+            dst[y_size + i + 1] = 128;
+        }
+    }
     return 0;
 }
 
@@ -500,49 +474,29 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 		this->started = true;
 		set_timer(this, true);
 
-		pthread_mutex_lock(&cam_lock);
-		
-		if (active_camera_impl != NULL && active_camera_impl != this) {
-	        active_camera_impl->started = false;
-	        active_camera_impl = NULL;
-
-			if (cam_thread_started) {
-				pthread_mutex_lock(&frame_cond_lock);
-				keep_running = 0;
-				pthread_cond_signal(&frame_cond);
-				pthread_mutex_unlock(&frame_cond_lock);
-
-				pthread_join(cam_thread, NULL);
-				cam_thread_started = false;
-			}
-
-			active_camera_impl = NULL;
-	    }
-
-	    active_camera_impl = this;
-
-		if (!cam_thread_started) {
-			keep_running = 1;
-            cam_thread_started = true;
-            if (pthread_create(&cam_thread, NULL, camera_event_loop,  (void *)this) != 0) {
+        fprintf(stderr, "[droidcam] Start %p\n", this);
+        if (!this->cam_thread_started) {
+            this->keep_running = 1;
+            this->cam_thread_started = true;
+            this->last_frame_size = 0;
+            if (pthread_create(&this->cam_thread, NULL, camera_event_loop,  (void *)this) != 0) {
                 perror("pthread_create failed");
             } else {
                 fprintf(stderr, "[droidcam] camera_event_loop thread started\n");
             }
         }
-
-        pthread_mutex_unlock(&cam_lock);
 		break;
 	}
 	case SPA_NODE_COMMAND_Suspend:
-		pthread_mutex_lock(&frame_cond_lock);
-		keep_running = 0;
-		pthread_cond_signal(&frame_cond);
-		pthread_mutex_unlock(&frame_cond_lock);
-		pthread_join(cam_thread, NULL);
+		fprintf(stderr, "[droidcam] Suspend %p\n", this);
+		this->keep_running = 0;
+		this->last_frame_size = 0;
+		break;
 	case SPA_NODE_COMMAND_Pause:
 		if (!this->started)
 			return 0;
+		fprintf(stderr, "[droidcam] Pause %p\n", this);
+		this->last_frame_size = 0;
 		this->started = false;
 		set_timer(this, false);
 		break;
@@ -639,12 +593,15 @@ static int port_enum_formats(void *object,
 	switch (index) {
 	case 0:
         *param = spa_pod_builder_add_object(builder,
-            SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-            SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
-            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-            SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_RGB),
-            SPA_FORMAT_VIDEO_size,   SPA_POD_Rectangle(&SPA_RECTANGLE(1920, 1080)),
-            SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&SPA_FRACTION(30, 1)));
+			SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+			SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
+			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+			SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_NV21),
+			SPA_FORMAT_VIDEO_size,   SPA_POD_CHOICE_RANGE_Rectangle(
+											&SPA_RECTANGLE(640, 480),
+											&SPA_RECTANGLE(640, 480),
+											&SPA_RECTANGLE(1920, 1080)),
+			SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&SPA_FRACTION(30, 1)));
         break;
 	default:
 		return 0;
@@ -705,11 +662,13 @@ impl_node_port_enum_params(void *object, int seq,
 		if (result.index > 0)
 			return 0;
 
+		uint32_t buf_size = port->stride * raw_info->size.height * 3 / 2;
+
 		param = spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_ParamBuffers, id,
 			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(2, 1, MAX_BUFFERS),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
-			SPA_PARAM_BUFFERS_size,    SPA_POD_Int(port->stride * raw_info->size.height),
+			SPA_PARAM_BUFFERS_size,    SPA_POD_Int(buf_size),
 			SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(port->stride));
 		break;
 	}
@@ -793,8 +752,11 @@ static int port_set_format(struct impl *this, struct port *port,
 		if (spa_format_video_raw_parse(format, &info.info.raw) < 0)
 			return -EINVAL;
 
-		if (info.info.raw.format == SPA_VIDEO_FORMAT_RGB)
-            port->bpp = 3;
+		this->frameWidth = info.info.raw.size.width;
+		this->frameHeight = info.info.raw.size.height;
+
+		if (info.info.raw.format == SPA_VIDEO_FORMAT_NV21)
+            port->bpp = 1;
         else
             return -EINVAL;
 
@@ -903,6 +865,7 @@ impl_node_port_set_io(void *object,
 {
 	struct impl *this = object;
 	struct port *port;
+	fprintf(stderr, "[droidcam] impl_node_port_set_io %p, %p\n", active_camera_impl, this);
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 	spa_return_val_if_fail(CHECK_PORT(this, direction, port_id), -EINVAL);
@@ -1017,6 +980,8 @@ static int impl_clear(struct spa_handle *handle)
 
 	this = (struct impl *) handle;
 
+	fprintf(stderr, "[droidcam] Clear %p\n", this);
+
 	if (this->data_loop)
 		spa_loop_invoke(this->data_loop, do_remove_timer, 0, NULL, 0, true, this);
 	spa_loop_utils_destroy_source(this->loop_utils, this->timer_source);
@@ -1038,6 +1003,7 @@ impl_init(const struct spa_handle_factory *factory,
 	  const struct spa_support *support,
 	  uint32_t n_support)
 {
+	fprintf(stderr, "[droidcam] IMPL INIT\n");
 	struct impl *this;
 	struct port *port;
 	const char *str = NULL;
@@ -1057,6 +1023,12 @@ impl_init(const struct spa_handle_factory *factory,
     }
 
     this->orientation = SPA_META_TRANSFORMATION_None;
+    this->last_frame_size = 0;
+	this->frame_ready = false;
+	this->keep_running = 1;
+	this->cam_thread_started = false;
+	this->frameWidth = 640;
+	this->frameHeight = 480;
 
 	this->log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log);
 	this->data_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataLoop);
@@ -1092,6 +1064,7 @@ impl_init(const struct spa_handle_factory *factory,
 	port->info = SPA_PORT_INFO_INIT();
 	port->info.flags = SPA_PORT_FLAG_NO_REF;
 	port->info.flags |= SPA_PORT_FLAG_LIVE;
+	port->info.flags |= SPA_PORT_FLAG_DYNAMIC_DATA;
 	port->params[0] = SPA_PARAM_INFO(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
 	port->params[1] = SPA_PARAM_INFO(SPA_PARAM_Meta, SPA_PARAM_INFO_READ);
 	port->params[2] = SPA_PARAM_INFO(SPA_PARAM_IO, SPA_PARAM_INFO_READ);
