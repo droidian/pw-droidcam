@@ -180,6 +180,45 @@ void cleanup_camera_resources(struct impl *this,
     }
 }
 
+void setup_fake_egl(EGLDisplay *display,
+					EGLContext *context,
+                    EGLSurface *surface,
+                    GLuint *texture_id)
+{
+	EGLConfig config;
+    EGLint num_configs;
+	EGLint config_attribs[] = {
+		EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+		EGL_RED_SIZE, 8,
+		EGL_GREEN_SIZE, 8,
+		EGL_BLUE_SIZE, 8,
+		EGL_ALPHA_SIZE, 8,
+		EGL_NONE
+	};
+	EGLint pbuffer_attribs[] = {
+		EGL_WIDTH, 1,
+		EGL_HEIGHT, 1,
+		EGL_NONE,
+	};
+	EGLint context_attribs[] = {
+		EGL_CONTEXT_CLIENT_VERSION, 2,
+		EGL_NONE
+	};
+	display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+	eglInitialize(display, NULL, NULL);
+	eglChooseConfig(display, config_attribs, &config, 1, &num_configs);
+	surface = eglCreatePbufferSurface(display, config, pbuffer_attribs);
+	context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
+	eglMakeCurrent(display, surface, surface, context);
+	glGenTextures(1, texture_id);
+	glBindTexture(GL_TEXTURE_EXTERNAL_OES, *texture_id);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
 void *camera_event_loop(void *arg) {
 	struct impl *this = (struct impl *)arg;
 
@@ -187,41 +226,11 @@ void *camera_event_loop(void *arg) {
     EGLContext context = EGL_NO_CONTEXT;
     EGLSurface surface = EGL_NO_SURFACE;
     GLuint preview_texture_id = 0;
-    EGLConfig config;
-    EGLint num_configs;
 
     while (keep_running) {
     	if(this->cc == NULL && this->started){
-    		EGLint config_attribs[] = {
-		        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-		        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-		        EGL_RED_SIZE, 8,
-		        EGL_GREEN_SIZE, 8,
-		        EGL_BLUE_SIZE, 8,
-		        EGL_ALPHA_SIZE, 8,
-		        EGL_NONE
-		    };
 
-		    EGLint pbuffer_attribs[] = {
-		        EGL_WIDTH, 1,
-		        EGL_HEIGHT, 1,
-		        EGL_NONE,
-		    };
-
-		    EGLint context_attribs[] = {
-		        EGL_CONTEXT_CLIENT_VERSION, 2,
-		        EGL_NONE
-		    };
-
-		    display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-		    eglInitialize(display, NULL, NULL);
-
-		    eglChooseConfig(display, config_attribs, &config, 1, &num_configs);
-
-		    surface = eglCreatePbufferSurface(display, config, pbuffer_attribs);
-		    context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
-		    eglMakeCurrent(display, surface, surface, context);
-
+    		setup_fake_egl(display, context, surface, &preview_texture_id);
 	        fprintf(stderr, "[droidcam] Create new listener\n");
 	        memset(&this->listener, 0, sizeof(this->listener));  
 	        this->listener.on_preview_frame_cb = preview_frame_cb;
@@ -231,13 +240,6 @@ void *camera_event_loop(void *arg) {
 	        fprintf(stderr, "[droidcam] Connect to camera\n");
 	        this->cc = android_camera_connect_to(this->camera_id, &this->listener);
 	        this->listener.context = this->cc;
-
-	        glGenTextures(1, &preview_texture_id);
-	        glBindTexture(GL_TEXTURE_EXTERNAL_OES, preview_texture_id);
-	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 	        android_camera_set_preview_texture(this->cc, preview_texture_id);
 	        android_camera_set_preview_callback_mode(this->cc, PREVIEW_CALLBACK_ENABLED);
