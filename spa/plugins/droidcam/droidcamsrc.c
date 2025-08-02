@@ -535,11 +535,13 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 		break;
 	}
 	case SPA_NODE_COMMAND_Suspend:
-		pthread_mutex_lock(&frame_cond_lock);
-		keep_running = 0;
-		pthread_cond_signal(&frame_cond);
-		pthread_mutex_unlock(&frame_cond_lock);
-		pthread_join(cam_thread, NULL);
+		if(this == active_camera_impl){
+			pthread_mutex_lock(&frame_cond_lock);
+			keep_running = 0;
+			pthread_cond_signal(&frame_cond);
+			pthread_mutex_unlock(&frame_cond_lock);
+			pthread_join(cam_thread, NULL);
+		}
 	case SPA_NODE_COMMAND_Pause:
 		if (!this->started)
 			return 0;
