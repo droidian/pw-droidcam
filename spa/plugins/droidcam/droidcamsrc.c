@@ -40,6 +40,8 @@
 SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.droidcamsrc");
 
 #define MAX_FRAME_SIZE (1920 * 1080 * 4)
+pthread_cond_t frame_cond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t frame_cond_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t frame_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t cam_lock = PTHREAD_MUTEX_INITIALIZER;
 uint8_t last_frame_data[MAX_FRAME_SIZE];
@@ -134,7 +136,10 @@ void preview_frame_cb(void* data, uint32_t data_size, void* context)
 
 void preview_texture_needs_update_cb(void* ctx)
 {
+    pthread_mutex_lock(&frame_cond_lock);
     frameAvailable = true;
+    pthread_cond_signal(&frame_cond);
+    pthread_mutex_unlock(&frame_cond_lock);
 }
 
 void error_msg_cb(void* context)
@@ -238,18 +243,28 @@ void *camera_event_loop(void *arg) {
 	        android_camera_set_preview_callback_mode(this->cc, PREVIEW_CALLBACK_ENABLED);
 	        android_camera_set_preview_size(this->cc, 1920, 1080);
 	        android_camera_start_preview(this->cc);
+	        pthread_mutex_lock(&frame_cond_lock);
+			frameAvailable = true;
+			pthread_cond_signal(&frame_cond);
+			pthread_mutex_unlock(&frame_cond_lock);
 	    }
 
-        if (frameAvailable && this->started) {
-            frameAvailable = false;
-            android_camera_update_preview_texture(this->cc);
-        }
+		pthread_mutex_lock(&frame_cond_lock);
+		while (!frameAvailable && keep_running) {
+		    pthread_cond_wait(&frame_cond, &frame_cond_lock);
+		}
 
-        if (!this->started && this->cc != NULL) {
-            cleanup_camera_resources(this, &display, &context, &surface, &preview_texture_id);
-        }
+		if (!keep_running) {
+		    pthread_mutex_unlock(&frame_cond_lock);
+		    break;
+		}
 
-        usleep(10000); // 10ms
+		frameAvailable = false;
+		pthread_mutex_unlock(&frame_cond_lock);
+
+		if (this->started) {
+		    android_camera_update_preview_texture(this->cc);
+		}
     }
 
     cleanup_camera_resources(this, &display, &context, &surface, &preview_texture_id);
@@ -470,7 +485,11 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 	        active_camera_impl = NULL;
 
 			if (cam_thread_started) {
+				pthread_mutex_lock(&frame_cond_lock);
 				keep_running = 0;
+				pthread_cond_signal(&frame_cond);
+				pthread_mutex_unlock(&frame_cond_lock);
+
 				pthread_join(cam_thread, NULL);
 				cam_thread_started = false;
 			}
